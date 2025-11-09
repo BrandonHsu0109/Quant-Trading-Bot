@@ -1,3 +1,4 @@
+# portfolio.py
 def calc_rebalance_orders(current_positions: dict[str, float],
                           prices: dict[str, float],
                           target_weights: dict[str, float],
@@ -6,6 +7,7 @@ def calc_rebalance_orders(current_positions: dict[str, float],
 
     orders: list[dict] = []
 
+    # 先把所有「目標裡沒有，但現在有持倉」的全部清掉
     to_clear = set(current_positions.keys()) - set(target_weights.keys())
     for s in to_clear:
         qty = current_positions.get(s, 0.0)
@@ -26,10 +28,16 @@ def calc_rebalance_orders(current_positions: dict[str, float],
 
         side = "buy" if diff_val > 0 else "sell"
         qty = abs(diff_val) / price
+
+        # 🔴 這一行是關鍵：把數量無條件取整數
+        qty_int = int(qty)
+        if qty_int <= 0:
+            continue
+
         orders.append({
             "symbol": s,
             "side": side,
-            "qty": round(qty, 6),
+            "qty": qty_int,
         })
 
     return orders

@@ -1,16 +1,26 @@
 # main.py
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
+
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, Dict, Any, List, Tuple
+from collections import defaultdict, deque
+from zoneinfo import ZoneInfo
+
+import config
+from horus_client import HorusClient
+from strategies.manager import StrategyManager
+from exchange_client import ExchangeClient
+from portfolio import calc_rebalance_orders
+from execution import execute_orders
 
 # =========================
 # Logging setup
 # =========================
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, config.LOG_LEVEL),
     format="%(asctime)s %(levelname)s %(message)s"
 )
 logger = logging.getLogger()
@@ -57,21 +67,14 @@ UNIVERSE: List[Tuple[str, str]] = [
     ("XRP/USD", "XRP"),
 ]
 
-# 只比對「幣種本體」（斜線左邊），避免字串包含誤殺 /USD
-UNSUPPORTED_BASE = {
-    "1000CHEEMS","ASTER","AVNT","BIO","BMT","CAKE","CFX","CRV",
-    "EDEN","EIGEN","FLOKI","HEMI","LINEA","LISTA","MIRA","OPEN",
-    "PAXG","PENDLE","PENGU","PLUME","PUMP","S","SOMI","STO",
-    "TUT","WIF","WLFI","XPL","ZEC","ZEN"
-}
+# =========================
+# Utils: 時間 / CSV 輸出（可有可無）
+# =========================
 
-# =========================
-# Utils
-# =========================
 def _to_iso8601_utc(ts) -> str | None:
     try:
         if isinstance(ts, (int, float)):
-            if ts > 1e12:  # 毫秒
+            if ts > 1e12:  # 毫秒轉秒
                 ts = ts / 1000.0
             return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
         if isinstance(ts, str):
@@ -88,10 +91,11 @@ def _to_iso8601_utc(ts) -> str | None:
     except Exception:
         return None
 
+
 def filter_rows_by_day_utc(rows: Iterable[Dict[str, Any]], day_yyyy_mm_dd: str) -> List[Dict[str, Any]]:
     start = datetime.strptime(day_yyyy_mm_dd, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end = start + timedelta(days=1)
-    kept = []
+    kept: List[Dict[str, Any]] = []
     for r in rows or []:
         ts = r.get("timestamp")
         dt_utc_iso = _to_iso8601_utc(ts)
@@ -102,7 +106,12 @@ def filter_rows_by_day_utc(rows: Iterable[Dict[str, Any]], day_yyyy_mm_dd: str) 
             kept.append(r)
     return kept
 
+
 def emit_rows_csv(symbol: str, rows: Iterable[Dict[str, Any]]) -> None:
+    """
+    若你想同時輸出 CSV 方便 debug：
+    幣種, timestamp, price
+    """
     for r in rows or []:
         ts_iso = _to_iso8601_utc(r.get("timestamp"))
         price = r.get("price")
@@ -110,7 +119,13 @@ def emit_rows_csv(symbol: str, rows: Iterable[Dict[str, Any]]) -> None:
             continue
         print(f"{symbol},{ts_iso},{price}")
 
-def process_and_emit(symbol: str, raw_rows: Iterable[Dict[str, Any]] | None, day_yyyy_mm_dd: str, fallback_last_n: int = 20) -> int:
+
+def process_and_emit(
+    symbol: str,
+    raw_rows: Iterable[Dict[str, Any]] | None,
+    day_yyyy_mm_dd: str,
+    fallback_last_n: int = 20,
+) -> int:
     raw_rows = list(raw_rows or [])
     picked = filter_rows_by_day_utc(raw_rows, day_yyyy_mm_dd)
     if not picked and raw_rows:
@@ -118,25 +133,13 @@ def process_and_emit(symbol: str, raw_rows: Iterable[Dict[str, Any]] | None, day
     emit_rows_csv(symbol, picked)
     return len(picked)
 
-# =========================
-# Data source hook（把你的 ROOSTOO/Horus 抓價接進來）
-# =========================
-def get_price_rows(symbol_pair: str) -> List[Dict[str, Any]]:
-    """
-    回傳 list[dict]，每列至少含 {'timestamp': ..., 'price': ...}
-    TODO: 這裡接你原本從 ROOSTOO 取數的函式，保持鍵名 timestamp / price。
-    """
-    return []  # 先留空；接好後就會有輸出
 
-# =========================
-# Normalization
-# =========================
 def normalize_rows_to_tp(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for r in rows or []:
         ts = r.get("timestamp")
         px = r.get("price")
-        if px is None:
+        if px is None or ts is None:
             continue
         try:
             price_f = float(px)
@@ -146,57 +149,228 @@ def normalize_rows_to_tp(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]
     return out
 
 # =========================
-# Strategy placeholders
+# Data Handler（給 four_hr_range / xsec_momentum 用）
 # =========================
-def strategies_breakdown(today_utc: str, processed_symbols: List[Tuple[str,str]]) -> None:
-    logger.info("== strategy breakdown begin ==")
-    logger.info("[four_hr_range] no picks")
-    logger.info("[xsec_momentum] no picks")
-    logger.info("[final] no combined picks")
-    logger.info("== strategy breakdown end ==")
+
+class LiveDataHandler:
+    """
+    用 Horus 歷史價組一個簡化版 DataHandler：
+    - buffers[pair] 裡放一串 (datetime_utc, price)
+    - xsec_momentum 用這個算動能
+    - four_hr_range 用這個算第一個 4 小時區間
+    """
+
+    def __init__(self, maxlen: int = 1000):
+        self.buffers: dict[str, deque] = defaultdict(lambda: deque(maxlen=maxlen))
+        self.ny = ZoneInfo("America/New_York")
+        self.first4h_cache: dict[tuple[str, str], tuple[float, float]] = {}
+
+    def _to_dt_utc(self, ts) -> datetime | None:
+        try:
+            if isinstance(ts, (int, float)):
+                if ts > 1e12:
+                    ts = ts / 1000.0
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+            if isinstance(ts, str):
+                if ts.endswith("Z"):
+                    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+                if "+" in ts:
+                    return datetime.fromisoformat(ts).astimezone(timezone.utc)
+                return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+            if isinstance(ts, datetime):
+                if ts.tzinfo is None:
+                    return ts.replace(tzinfo=timezone.utc)
+                return ts.astimezone(timezone.utc)
+            return None
+        except Exception:
+            return None
+
+    def update_series(self, pair: str, rows: List[Dict[str, Any]]) -> None:
+        dq = self.buffers[pair]
+        dq.clear()
+        for r in sorted(rows, key=lambda x: x["timestamp"]):
+            dt = self._to_dt_utc(r["timestamp"])
+            if dt is None:
+                continue
+            dq.append((dt, r["price"]))
+
+    # ---- four_hr_range 需要的方法 ----
+
+    def _first_4h_window_utc(self, any_utc: datetime):
+        ny_dt = any_utc.astimezone(self.ny)
+        start_ny = datetime(ny_dt.year, ny_dt.month, ny_dt.day, 0, 0, tzinfo=self.ny)
+        end_ny = start_ny + timedelta(hours=4)
+        return start_ny.astimezone(timezone.utc), end_ny.astimezone(timezone.utc), start_ny.date()
+
+    def is_after_first4h_close(self) -> bool:
+        now_utc = datetime.now(timezone.utc)
+        ny_dt = now_utc.astimezone(self.ny)
+        return ny_dt.hour >= 4
+
+    def get_first4h_range(self, pair: str):
+        dq = self.buffers.get(pair)
+        if not dq:
+            return None, None, None
+        last_ts = dq[-1][0]
+        start_utc, end_utc, ny_date = self._first_4h_window_utc(last_ts)
+        key = (pair, ny_date)
+        if key in self.first4h_cache:
+            hi, lo = self.first4h_cache[key]
+            return hi, lo, str(ny_date)
+        hi = None
+        lo = None
+        for ts, px in dq:
+            if start_utc <= ts < end_utc:
+                hi = px if hi is None else max(hi, px)
+                lo = px if lo is None else min(lo, px)
+        if hi is not None and lo is not None:
+            self.first4h_cache[key] = (hi, lo)
+            return hi, lo, str(ny_date)
+        return None, None, str(ny_date)
+
+    def first4h_ready(self, pair: str) -> bool:
+        hi, lo, _ = self.get_first4h_range(pair)
+        return hi is not None and lo is not None
+
+    def is_5m_bar_close(self, pair: str) -> bool:
+        # 我們用 Horus 15m K，這裡簡化：每次 run_once 就當作一根 bar close
+        return True
+
+    def get_5m_close(self, pair: str):
+        dq = self.buffers.get(pair)
+        if not dq:
+            return None
+        return dq[-1][1]
 
 # =========================
-# Per-symbol handler
+# Horus 抓價
 # =========================
-def handle_symbol(symbol_pair: str, internal_symbol: str, day_utc_str: str) -> None:
-    rows = get_price_rows(symbol_pair)
 
-    sample_keys = []
-    n = 0
-    if rows:
-        sample_keys = list(rows[0].keys())[:2]
-        n = len(rows)
-    logger.info("[horus] %s->%s sample_keys=%s n=%d", symbol_pair, internal_symbol, sample_keys or ['timestamp','price'], n)
+_horus_client = HorusClient()
+_exchange_client = ExchangeClient()
+_strategy_manager = StrategyManager(allow_short=config.ALLOW_SHORT)
 
-    parsed_rows = normalize_rows_to_tp(rows)
-    logger.info("[horus] %s->%s parsed_rows=%d", symbol_pair, internal_symbol, len(parsed_rows))
-    if not parsed_rows:
-        logger.info("[horus] no rows for %s %s", symbol_pair, day_utc_str)
-
-    try:
-        process_and_emit(internal_symbol, parsed_rows, day_utc_str, fallback_last_n=20)
-    except Exception as e:
-        logger.exception("emit csv failed for %s: %s", internal_symbol, e)
+def get_price_rows(symbol_pair: str) -> List[Dict[str, Any]]:
+    """
+    從 HorusClient 抓一段時間的歷史價：
+    回傳 list[{'timestamp': ..., 'price': ...}]
+    """
+    end = datetime.now(timezone.utc)
+    lookback_hours = getattr(config, "LOOKBACK_HOURS", 24)
+    start = end - timedelta(hours=lookback_hours)
+    return _horus_client.fetch_range_prices(symbol_pair, start, end)
 
 # =========================
-# Main
+# 單次 run：抓資料 → 餵策略 → 算單 → 下單
 # =========================
-def main():
+
+def run_once():
     today_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    processed: List[Tuple[str, str]] = []
+    data_handler = LiveDataHandler()
+    prices: dict[str, float] = {}
+    liquidity: dict[str, float] = {}
 
+    # 1) 抓 Horus 價格，更新 data_handler
     for symbol_pair, internal_symbol in UNIVERSE:
-        base = symbol_pair.split("/")[0]  # 只取幣種，不含 /USD
-        if base in UNSUPPORTED_BASE:
-            logger.info("[horus] skip unsupported asset %s for %s", base, symbol_pair)
+        rows = get_price_rows(symbol_pair)
+
+        sample_keys = []
+        n = 0
+        if rows:
+            sample_keys = list(rows[0].keys())[:2]
+            n = len(rows)
+        logger.info(
+            "[horus] %s->%s sample_keys=%s n=%d",
+            symbol_pair,
+            internal_symbol,
+            sample_keys or ["timestamp", "price"],
+            n,
+        )
+
+        parsed_rows = normalize_rows_to_tp(rows)
+        logger.info(
+            "[horus] %s->%s parsed_rows=%d",
+            symbol_pair,
+            internal_symbol,
+            len(parsed_rows),
+        )
+        if not parsed_rows:
             logger.info("[horus] no rows for %s %s", symbol_pair, today_utc_str)
             continue
 
-        handle_symbol(symbol_pair, internal_symbol, today_utc_str)
-        processed.append((symbol_pair, internal_symbol))
+        # (選擇性) 輸出 CSV
+        try:
+            process_and_emit(internal_symbol, parsed_rows, today_utc_str, fallback_last_n=20)
+        except Exception as e:
+            logger.exception("emit csv failed for %s: %s", internal_symbol, e)
 
-    strategies_breakdown(today_utc_str, processed)
+        # 更新 data_handler 給策略用
+        data_handler.update_series(symbol_pair, parsed_rows)
+
+        # 策略用最新價格
+        last_price = parsed_rows[-1]["price"]
+        prices[symbol_pair] = last_price
+
+        # 目前沒有真實成交量，先給一個大數，搭配 MIN_24H_VOLUME=0 就等於不過濾
+        liquidity[symbol_pair] = 1e12
+
+    if not prices:
+        logger.info("no prices fetched; skip this round")
+        return
+
+    # 2) 跑策略，得到 target_weights
+    target_weights = _strategy_manager.combine(data_handler, prices, liquidity)
+    if not target_weights:
+        logger.info("no target weights (no picks); skip trading this round")
+        return
+
+    logger.info(f"target_weights: {target_weights}")
+
+    # 3) 讀取目前持倉 & equity
+    try:
+        positions, equity = _exchange_client.get_positions_and_equity(prices)
+    except Exception as e:
+        logger.exception(f"get_positions_and_equity failed: {e}")
+        return
+
+    logger.info(f"current positions: {positions}, equity={equity:.2f}")
+
+    # 4) 計算需要的調整單
+    orders = calc_rebalance_orders(
+        current_positions=positions,
+        prices=prices,
+        target_weights=target_weights,
+        total_equity=equity,
+        min_notional=config.MIN_NOTIONAL,
+    )
+
+    if not orders:
+        logger.info("no rebalance orders; portfolio already aligned with target")
+        return
+
+    logger.info(f"proposed orders: {orders}")
+
+    # 5) 依 DRY_RUN 決定是否真的送單
+    if getattr(config, "DRY_RUN", True):
+        logger.info("[DRY_RUN] skip sending orders")
+    else:
+        execute_orders(_exchange_client, orders, retry=1)
+
+# =========================
+# Main loop：每隔一段時間跑一次
+# =========================
+
+def main_loop():
+    interval_sec = getattr(config, "LOOP_INTERVAL_SEC", getattr(config, "ORDER_INTERVAL_SEC", 60))
+    logger.info(f"Starting main loop, interval={interval_sec} sec, DRY_RUN={getattr(config, 'DRY_RUN', True)}")
+    while True:
+        try:
+            run_once()
+        except Exception:
+            logger.exception("run_once failed")
+        time.sleep(interval_sec)
+
 
 if __name__ == "__main__":
-    main()
+    main_loop()
