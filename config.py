@@ -26,6 +26,9 @@ HORUS_PRICE_FIELDS = ["price", "p", "close", "c"]
 ORDER_INTERVAL_SEC = 300          
 LOOP_INTERVAL_SEC = ORDER_INTERVAL_SEC   # time interval for main_loop calls
 
+LOG_FILE = "logs/run.log"
+LOG_LEVEL = "INFO"
+
 LOOKBACK_MINUTES = 1200                       
 
 MIN_24H_VOLUME = 0               # four_hr_range 的流動性篩選，暫時設 0 = 不篩
