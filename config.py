@@ -29,7 +29,10 @@ LOOP_INTERVAL_SEC = ORDER_INTERVAL_SEC   # time interval for main_loop calls
 LOG_FILE = "logs/run.log"
 LOG_LEVEL = "INFO"
 
-LOOKBACK_MINUTES = 1200                       
+TRADE_LOG_FILE = "logs/trades.csv"   
+EQUITY_LOG_FILE = "logs/equity.csv" 
+
+LOOKBACK_MINUTES = 240                       
 
 MIN_24H_VOLUME = 0               # four_hr_range 的流動性篩選，暫時設 0 = 不篩
 MAX_POSITION_PER_SYMBOL = 0.35   # 單一幣種最大權重上限
@@ -60,7 +63,7 @@ STRATEGIES = [
         "name": "breakout_scalping",
         "alloc": 0.3,
         "params": {
-            "lookback_min": 15,          # 觀察窗
+            "lookback_min": 5,          # 觀察窗
             "trig_eps": 0.001,           # 突破幅度 0.1%
             "sl_mult": 0.6,              # 停損 = entry - 0.6 * range
             "tp_mult": 0.8,              # 停利 = entry + 0.8 * range

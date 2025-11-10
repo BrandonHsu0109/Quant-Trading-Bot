@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import time
+import os
+import csv
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, Dict, Any, List, Tuple
 from collections import defaultdict, deque
@@ -263,6 +265,27 @@ def get_price_rows(symbol_pair: str) -> List[Dict[str, Any]]:
 # =========================
 # 單次 run：抓資料 → 餵策略 → 算單 → 下單
 # =========================
+EQUITY_LOG_FILE = getattr(config, "EQUITY_LOG_FILE", "logs/equity.csv")
+
+def log_equity_snapshot(total_equity: float, usd_free: float):
+    """
+    把每一輪 run 的總資產 / 現金餘額寫進 CSV
+    """
+    try:
+        if EQUITY_LOG_FILE:
+            os.makedirs(os.path.dirname(EQUITY_LOG_FILE), exist_ok=True)
+            file_exists = os.path.exists(EQUITY_LOG_FILE)
+            with open(EQUITY_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if not file_exists:
+                    w.writerow(["ts", "equity", "cash"])
+                w.writerow([
+                    datetime.now(timezone.utc).isoformat(),
+                    f"{total_equity:.8f}",
+                    f"{usd_free:.8f}",
+                ])
+    except Exception as e:
+        logging.error(f"failed to append equity log: {e}")
 
 def run_once():
     today_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -271,7 +294,7 @@ def run_once():
     prices: dict[str, float] = {}
     liquidity: dict[str, float] = {}
 
-    # 1) 抓 Horus 價格，更新 data_handler
+    # 1) 先抓 Horus 價格，更新 data_handler / prices / liquidity
     for symbol_pair, internal_symbol in UNIVERSE:
         rows = get_price_rows(symbol_pair)
 
@@ -299,64 +322,58 @@ def run_once():
             logger.info("[horus] no rows for %s %s", symbol_pair, today_utc_str)
             continue
 
-        # (選擇性) 輸出 CSV
+        # 你原本要的 CSV 輸出（可留可刪）
         try:
-            process_and_emit(internal_symbol, parsed_rows, today_utc_str, fallback_last_n=20)
+            process_and_emit(
+                internal_symbol, parsed_rows, today_utc_str, fallback_last_n=20
+            )
         except Exception as e:
             logger.exception("emit csv failed for %s: %s", internal_symbol, e)
 
-        # 更新 data_handler 給策略用
+        # 更新給策略用的資料
         data_handler.update_series(symbol_pair, parsed_rows)
-
-        # 策略用最新價格
         last_price = parsed_rows[-1]["price"]
         prices[symbol_pair] = last_price
+        liquidity[symbol_pair] = 1e12  # 暫時沒真實 volume，用大數字避免被過濾
 
-        # 目前沒有真實成交量，先給一個大數，搭配 MIN_24H_VOLUME=0 就等於不過濾
-        liquidity[symbol_pair] = 1e12
+    # 2) 用策略算目標權重
+    strat_mgr = StrategyManager(allow_short=config.ALLOW_SHORT)
+    target_weights = strat_mgr.combine(data_handler, prices, liquidity)
+    logger.info("target_weights: %s", target_weights)
 
-    if not prices:
-        logger.info("no prices fetched; skip this round")
-        return
-
-    # 2) 跑策略，得到 target_weights
-    target_weights = _strategy_manager.combine(data_handler, prices, liquidity)
     if not target_weights:
-        logger.info("no target weights (no picks); skip trading this round")
+        logger.info("no target weights, skip rebalance this run")
         return
 
-    logger.info(f"target_weights: {target_weights}")
+    # 3) 查詢當前部位和總資產 + 現金
+    ex_client = ExchangeClient()
+    positions, equity, usd_free = ex_client.get_positions_and_equity(prices)
 
-    # 3) 讀取目前持倉 & equity
-    try:
-        positions, equity = _exchange_client.get_positions_and_equity(prices)
-    except Exception as e:
-        logger.exception(f"get_positions_and_equity failed: {e}")
-        return
+    logger.info("current positions: %s, equity=%.2f, cash=%.2f", positions, equity, usd_free)
 
-    logger.info(f"current positions: {positions}, equity={equity:.2f}")
+    # 寫入 equity.csv
+    log_equity_snapshot(equity, usd_free)
 
-    # 4) 計算需要的調整單
+    # 4) 算出這次要下的單
     orders = calc_rebalance_orders(
         current_positions=positions,
         prices=prices,
         target_weights=target_weights,
         total_equity=equity,
-        min_notional=config.MIN_NOTIONAL,
+        min_notional=getattr(config, "MIN_NOTIONAL", 0.1),
     )
 
     if not orders:
         logger.info("no rebalance orders; portfolio already aligned with target")
         return
 
-    logger.info(f"proposed orders: {orders}")
+    logger.info("proposed orders: %s", orders)
 
-    # 5) 依 DRY_RUN 決定是否真的送單
+    # 5) 依 DRY_RUN 決定要不要真的下單
     if getattr(config, "DRY_RUN", True):
         logger.info("[DRY_RUN] skip sending orders")
     else:
-        execute_orders(_exchange_client, orders, retry=1)
-
+        execute_orders(ex_client, orders, retry=1)
 # =========================
 # Main loop：每隔一段時間跑一次
 # =========================

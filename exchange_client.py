@@ -71,51 +71,34 @@ class ExchangeClient:
 
     
     def get_positions_and_equity(self, prices: dict[str, float]):
-        bal = self.get_balance_raw()
-        logging.info(f"[exchange] raw balance response: {bal}")
+        """
+        讀取 Roostoo 餘額，計算：
+        - positions: { 'BTC/USD': 數量, ... }
+        - total_equity: 總資產（USD 現金 + 幣值 * 價格）
+        - usd_free: 現金餘額（USD 或 USDT）
+        """
 
-        # 先檢查 Success flag（如果有的話）
-        success = bal.get("Success")
-        if success is not None and not success:
+        bal = self.get_balance_raw()
+        logging.info("[exchange] raw balance response: %s", bal)
+
+        if not bal.get("Success"):
             raise RuntimeError(f"balance failed: {bal}")
 
-        # Roostoo 實際回的是 SpotWallet / MarginWallet
-        spot = bal.get("SpotWallet") or {}
-        margin = bal.get("MarginWallet") or {}
-        # 如果哪天 API 改成 Wallet，也一起支援
-        wallet_fallback = bal.get("Wallet") or {}
-
-        # 統一合併成一個錢包結構：coin -> {Free, Lock}
-        merged_wallet: dict[str, dict] = {}
-
-        def merge_wallet(src: dict):
-            for coin, info in src.items():
-                if not isinstance(info, dict):
-                    continue
-                dst = merged_wallet.setdefault(coin, {"Free": 0.0, "Lock": 0.0})
-                dst["Free"] += float(info.get("Free", info.get("free", 0.0)))
-                dst["Lock"] += float(info.get("Lock", info.get("lock", 0.0)))
-
-        if isinstance(spot, dict):
-            merge_wallet(spot)
-        if isinstance(margin, dict):
-            merge_wallet(margin)
-        if isinstance(wallet_fallback, dict):
-            merge_wallet(wallet_fallback)
+        # Roostoo 回傳欄位可能是 SpotWallet / Wallet，兩個都試
+        wallet = bal.get("SpotWallet") or bal.get("Wallet") or {}
 
         positions: dict[str, float] = {}
         total_equity = 0.0
+        usd_free = 0.0
 
-        # 現金部位（USD / USDT）
-        usd_info = merged_wallet.get("USD") or merged_wallet.get("USDT")
+        # 抓現金（USD 或 USDT）
+        usd_info = wallet.get("USD") or wallet.get("USDT")
         if usd_info:
             usd_free = float(usd_info.get("Free", 0.0))
             total_equity += usd_free
-        else:
-            usd_free = 0.0
 
-        # 幣種部位
-        for coin, info in merged_wallet.items():
+        # 把其他幣轉成部位
+        for coin, info in wallet.items():
             if coin in ("USD", "USDT"):
                 continue
             free_amt = float(info.get("Free", 0.0))
@@ -126,5 +109,8 @@ class ExchangeClient:
             px = prices.get(pair, 0.0)
             total_equity += free_amt * px
 
-        logging.info(f"[exchange] parsed positions: {positions}, total_equity={total_equity:.2f}")
-        return positions, total_equity
+        logging.info(
+            "[exchange] parsed positions: %s, total_equity=%.2f, usd_free=%.2f",
+            positions, total_equity, usd_free
+        )
+        return positions, total_equity, usd_free
