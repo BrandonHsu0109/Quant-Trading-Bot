@@ -60,17 +60,20 @@ STRATEGIES = [
         }
     },
     {
-        "name": "breakout_scalping",
-        "alloc": 0.3,
-        "params": {
-            "lookback_min": 5,          # 觀察窗
-            "trig_eps": 0.001,           # 突破幅度 0.1%
-            "sl_mult": 0.6,              # 停損 = entry - 0.6 * range
-            "tp_mult": 0.8,              # 停利 = entry + 0.8 * range
-            "timeout_min": 10,           # 逾時強平
-            "cooldown_min": 5,           # 冷卻
-            "trade_allocation_pct": 0.25,# 單幣配重（策略內部 cap 前）
-            "min_liq": 0                 # 如需用 UnitTradeValue 當門檻可設值
+    "name": "breakout_scalping",
+    "alloc": 0.3,
+    "params": {
+        "lookback_bars": 12,
+        "range_eps": 0.004,
+        "trig_eps": 0.0005,
+        "vol_mult": 1.5,
+        "atr_n": 14,
+        "sl_mult": 1.0,
+        "tp_mult": 2.0,
+        "timeout_min": 30,
+        "cooldown_min": 60,
+        "trade_allocation_pct": 0.25,
+        "min_liq": 0
         }
     }
 ]
