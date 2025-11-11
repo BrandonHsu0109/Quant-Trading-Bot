@@ -71,12 +71,6 @@ class ExchangeClient:
 
     
     def get_positions_and_equity(self, prices: dict[str, float]):
-        """
-        讀取 Roostoo 餘額，計算：
-        - positions: { 'BTC/USD': 數量, ... }
-        - total_equity: 總資產（USD 現金 + 幣值 * 價格）
-        - usd_free: 現金餘額（USD 或 USDT）
-        """
 
         bal = self.get_balance_raw()
         logging.info("[exchange] raw balance response: %s", bal)
@@ -84,20 +78,17 @@ class ExchangeClient:
         if not bal.get("Success"):
             raise RuntimeError(f"balance failed: {bal}")
 
-        # Roostoo 回傳欄位可能是 SpotWallet / Wallet，兩個都試
         wallet = bal.get("SpotWallet") or bal.get("Wallet") or {}
 
         positions: dict[str, float] = {}
         total_equity = 0.0
         usd_free = 0.0
 
-        # 抓現金（USD 或 USDT）
         usd_info = wallet.get("USD") or wallet.get("USDT")
         if usd_info:
             usd_free = float(usd_info.get("Free", 0.0))
             total_equity += usd_free
 
-        # 把其他幣轉成部位
         for coin, info in wallet.items():
             if coin in ("USD", "USDT"):
                 continue

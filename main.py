@@ -18,9 +18,7 @@ from exchange_client import ExchangeClient
 from portfolio import calc_rebalance_orders
 from execution import execute_orders
 
-# =========================
-# Logging setup
-# =========================
+
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
     format="%(asctime)s %(levelname)s %(message)s"
@@ -28,9 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger()
 logger.info("Starting Roostoo Quant Bot ...")
 
-# =========================
-# Config: Universe
-# =========================
+
 UNIVERSE: List[Tuple[str, str]] = [
     ("AAVE/USD", "AAVE"),
     ("ADA/USD", "ADA"),
@@ -69,10 +65,6 @@ UNIVERSE: List[Tuple[str, str]] = [
     ("XRP/USD", "XRP"),
 ]
 
-# =========================
-# Utils: 時間 / CSV 輸出（可有可無）
-# =========================
-
 def _to_iso8601_utc(ts) -> str | None:
     try:
         if isinstance(ts, (int, float)):
@@ -110,10 +102,6 @@ def filter_rows_by_day_utc(rows: Iterable[Dict[str, Any]], day_yyyy_mm_dd: str) 
 
 
 def emit_rows_csv(symbol: str, rows: Iterable[Dict[str, Any]]) -> None:
-    """
-    若你想同時輸出 CSV 方便 debug：
-    幣種, timestamp, price
-    """
     for r in rows or []:
         ts_iso = _to_iso8601_utc(r.get("timestamp"))
         price = r.get("price")
@@ -150,18 +138,7 @@ def normalize_rows_to_tp(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]
         out.append({"timestamp": ts, "price": price_f})
     return out
 
-# =========================
-# Data Handler（給 four_hr_range / xsec_momentum 用）
-# =========================
-
 class LiveDataHandler:
-    """
-    用 Horus 歷史價組一個簡化版 DataHandler：
-    - buffers[pair] 裡放一串 (datetime_utc, price)
-    - xsec_momentum 用這個算動能
-    - four_hr_range 用這個算第一個 4 小時區間
-    """
-
     def __init__(self, maxlen: int = 1000):
         self.buffers: dict[str, deque] = defaultdict(lambda: deque(maxlen=maxlen))
         self.ny = ZoneInfo("America/New_York")
@@ -195,8 +172,6 @@ class LiveDataHandler:
             if dt is None:
                 continue
             dq.append((dt, r["price"]))
-
-    # ---- four_hr_range 需要的方法 ----
 
     def _first_4h_window_utc(self, any_utc: datetime):
         ny_dt = any_utc.astimezone(self.ny)
@@ -235,7 +210,6 @@ class LiveDataHandler:
         return hi is not None and lo is not None
 
     def is_5m_bar_close(self, pair: str) -> bool:
-        # 我們用 Horus 15m K，這裡簡化：每次 run_once 就當作一根 bar close
         return True
 
     def get_5m_close(self, pair: str):
@@ -244,33 +218,20 @@ class LiveDataHandler:
             return None
         return dq[-1][1]
 
-# =========================
-# Horus 抓價
-# =========================
 
 _horus_client = HorusClient()
 _exchange_client = ExchangeClient()
 _strategy_manager = StrategyManager(allow_short=config.ALLOW_SHORT)
 
 def get_price_rows(symbol_pair: str) -> List[Dict[str, Any]]:
-    """
-    從 HorusClient 抓一段時間的歷史價：
-    回傳 list[{'timestamp': ..., 'price': ...}]
-    """
     end = datetime.now(timezone.utc)
     lookback_hours = getattr(config, "LOOKBACK_HOURS", 24)
     start = end - timedelta(hours=lookback_hours)
     return _horus_client.fetch_range_prices(symbol_pair, start, end)
 
-# =========================
-# 單次 run：抓資料 → 餵策略 → 算單 → 下單
-# =========================
 EQUITY_LOG_FILE = getattr(config, "EQUITY_LOG_FILE", "logs/equity.csv")
 
 def log_equity_snapshot(total_equity: float, usd_free: float):
-    """
-    把每一輪 run 的總資產 / 現金餘額寫進 CSV
-    """
     try:
         if EQUITY_LOG_FILE:
             os.makedirs(os.path.dirname(EQUITY_LOG_FILE), exist_ok=True)
@@ -294,7 +255,6 @@ def run_once():
     prices: dict[str, float] = {}
     liquidity: dict[str, float] = {}
 
-    # 1) 先抓 Horus 價格，更新 data_handler / prices / liquidity
     for symbol_pair, internal_symbol in UNIVERSE:
         rows = get_price_rows(symbol_pair)
 
@@ -322,7 +282,6 @@ def run_once():
             logger.info("[horus] no rows for %s %s", symbol_pair, today_utc_str)
             continue
 
-        # 你原本要的 CSV 輸出（可留可刪）
         try:
             process_and_emit(
                 internal_symbol, parsed_rows, today_utc_str, fallback_last_n=20
@@ -330,13 +289,11 @@ def run_once():
         except Exception as e:
             logger.exception("emit csv failed for %s: %s", internal_symbol, e)
 
-        # 更新給策略用的資料
         data_handler.update_series(symbol_pair, parsed_rows)
         last_price = parsed_rows[-1]["price"]
         prices[symbol_pair] = last_price
-        liquidity[symbol_pair] = 1e12  # 暫時沒真實 volume，用大數字避免被過濾
+        liquidity[symbol_pair] = 1e12 
 
-    # 2) 用策略算目標權重
     strat_mgr = StrategyManager(allow_short=config.ALLOW_SHORT)
     target_weights = strat_mgr.combine(data_handler, prices, liquidity)
     logger.info("target_weights: %s", target_weights)
@@ -344,17 +301,14 @@ def run_once():
     if not target_weights:
         logger.info("no target weights, skip rebalance this run")
         return
-
-    # 3) 查詢當前部位和總資產 + 現金
+    
     ex_client = ExchangeClient()
     positions, equity, usd_free = ex_client.get_positions_and_equity(prices)
 
     logger.info("current positions: %s, equity=%.2f, cash=%.2f", positions, equity, usd_free)
 
-    # 寫入 equity.csv
     log_equity_snapshot(equity, usd_free)
 
-    # 4) 算出這次要下的單
     orders = calc_rebalance_orders(
         current_positions=positions,
         prices=prices,
@@ -369,14 +323,10 @@ def run_once():
 
     logger.info("proposed orders: %s", orders)
 
-    # 5) 依 DRY_RUN 決定要不要真的下單
     if getattr(config, "DRY_RUN", True):
         logger.info("[DRY_RUN] skip sending orders")
     else:
         execute_orders(ex_client, orders, retry=1)
-# =========================
-# Main loop：每隔一段時間跑一次
-# =========================
 
 def main_loop():
     interval_sec = getattr(config, "LOOP_INTERVAL_SEC", getattr(config, "ORDER_INTERVAL_SEC", 60))

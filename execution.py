@@ -6,14 +6,11 @@ from datetime import datetime, timezone
 
 import config
 
-# 交易紀錄檔路徑，可從 config 覆寫
 TRADE_LOG_FILE = getattr(config, "TRADE_LOG_FILE", "logs/trades.csv")
 
 
 def _append_trade_log(order: dict, resp: dict):
-    """
-    把每筆下單（以及交易所回應 resp）寫到 CSV
-    """
+
     try:
         os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
         file_exists = os.path.exists(TRADE_LOG_FILE)
@@ -36,7 +33,6 @@ def execute_orders(exchange_client, orders: list[dict], retry: int = 1):
     for o in orders:
         for attempt in range(retry + 1):
             try:
-                # 注意：ExchangeClient.create_order 的參數叫 pair / quantity
                 resp = exchange_client.create_order(
                     pair=o["symbol"],
                     side=o["side"],

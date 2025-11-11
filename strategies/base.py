@@ -1,4 +1,4 @@
-#base.py
+# strategies/base.py
 class Strategy:
     def __init__(self, name: str, allow_short: bool, params: dict | None = None):
         self.name = name
