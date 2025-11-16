@@ -54,29 +54,13 @@ DRY_RUN = False   # For backtesting, True = simulation, False = real trading on 
 STRATEGIES = [
     {
         "name": "four_hr_range",
-        "alloc": 0.5,
+        "alloc": 1.0, 
         "params": {
-            "max_r_pct": 0.01,
-            "min_r_pct": 0.002,
+
+            "max_r_pct": 0.006,
+            "min_r_pct": 0.003,
+
             "trade_allocation_pct": 0.5
         }
     },
-    {
-    "name": "breakout_scalping",
-    "alloc": 0.3,
-    "params": {
-        "lookback_bars": 12,
-        "range_eps": 0.004,
-        "trig_eps": 0.0005,
-        "vol_mult": 1.5,
-        "atr_n": 14,
-        "sl_mult": 1.0,
-        "tp_mult": 2.0,
-        "timeout_min": 30,
-        "cooldown_min": 60,
-        "trade_allocation_pct": 0.25,
-        "min_liq": 0
-        }
-    }
 ]
-
